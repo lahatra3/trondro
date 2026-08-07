@@ -32,10 +32,11 @@ pub const PgClient = struct {
     }
 
     pub fn deinit(self: *PgClient) void {
+        std.log.info("[Postgresql]: closing connection...", .{});
         c.PQfinish(self.conn_handle);
     }
 
-    pub fn startAsyncCopyOut(self: *PgClient, query: [:0]const u8) PgCopyOut {
+    pub fn startAsyncCopyOut(self: *PgClient, query: [:0]const u8) !PgCopyOut {
         const res = c.PQsendQuery(self.conn_handle, query);
 
         if (res == 0) {
