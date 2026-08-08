@@ -12,7 +12,7 @@ pub fn build(b: *std.Build) void {
         .preferred_optimize_mode = .ReleaseSafe,
     });
 
-    const libpq_mod = b.dependency("libpq", .{
+    const libpq_dep = b.dependency("libpq", .{
         .target = target,
         .optimize = optimize,
     });
@@ -23,8 +23,8 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
-
-    trondro_mod.addImport("libpq", libpq_mod.module("libpq"));
+    
+    trondro_mod.linkLibrary(libpq_dep.artifact("pq"));
 
     const exe = b.addExecutable(.{
         .name = "trondro",

@@ -1,5 +1,5 @@
 const std = @import("std");
-const c = @import("libpq");
+const c = @import("c.zig").c;
 const PgCopyOut = @import("copy.zig").PgCopyOut;
 
 pub const PgClient = struct {
@@ -21,9 +21,8 @@ pub const PgClient = struct {
             c.PQfinish(conn);
             return error.PostgresqlConnectionFailed;
         }
-        std.log.info("[Postgresql]: Connection succeeded ...", .{});
 
-        std.log.info("[Postgresql]: Setting up non-blocking connection...", .{});
+        // Setting up non-blocking connection...
         _ = c.PQsetnonblocking(conn, 1);
 
         return .{
@@ -32,7 +31,6 @@ pub const PgClient = struct {
     }
 
     pub fn deinit(self: *PgClient) void {
-        std.log.info("[Postgresql]: closing connection...", .{});
         c.PQfinish(self.conn_handle);
     }
 

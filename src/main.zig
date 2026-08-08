@@ -1,41 +1,37 @@
 const std = @import("std");
-const PgClient = @import("postgres/client.zig").PgClient;
+const assert = std.debug.assert;
+const PgClient = @import("reader/client.zig").PgClient;
+const FileWriter = @import("writer/file_writer.zig").FileWriter;
 const Handler = @import("handler.zig").Handler;
+const Config = @import("config.zig").Config;
 
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
+    const allocator = init.arena.allocator();
+    const env_map = init.environ_map;
 
-    const pg_conn_info = "host=172.17.0.1 port=5431 dbname=dvdrental user=postgres password=p0stgr3s";
-    var pg_client = try PgClient.init(pg_conn_info);
+    const config = try Config.load(allocator, env_map);
+
+    assert(config.pg_conn_info.len > 0);
+    var pg_client = try PgClient.init(config.pg_conn_info);
     defer pg_client.deinit();
 
-    const file_path = "/home/jhs/Projects/zig/lahatra3/trondro.csv";
-    const sink_file = try std.Io.Dir.createFileAbsolute(
-        io,
-        file_path,
-        .{},
-    );
-    defer sink_file.close(io);
+    assert(config.file_path.len > 0);
+    var writer = try FileWriter.init(io, config.file_path);
+    defer writer.deinit();
 
-    const source_query =
-        \\ COPY (
-        \\  SELECT * FROM public.rental
-        \\ ) TO STDOUT
-        \\ WITH (
-        \\  FORMAT CSV,
-        \\  HEADER true,
-        \\  DELIMITER '|'
-        \\ );
-    ;
-    var copy_stream = try pg_client.startAsyncCopyOut(source_query);
+    assert(config.pg_copy_query.len > 0);
+    var reader = try pg_client.startAsyncCopyOut(config.pg_copy_query);
 
     var handler = try Handler.init();
     defer handler.deinit();
 
-    std.log.info("Processing...", .{});
+    std.log.info("[Trondro]: Start processing...", .{});
     try handler.handleStream(
-        &copy_stream,
-        sink_file.handle,
+        &reader,
+        writer.handle,
     );
-    std.log.info("Successfully completed...", .{});
+    try writer.sync();
+
+    std.log.info("[Trondro]: Processing completed successfully...", .{});
 }

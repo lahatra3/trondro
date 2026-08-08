@@ -1,18 +1,20 @@
 const std = @import("std");
-const assert = std.debug.assert;
-const linux = std.os.linux;
 const posix = std.posix;
-const PgCopyOut = @import("postgres/copy.zig").PgCopyOut;
+const linux = std.os.linux;
+const assert = std.debug.assert;
+const PgCopyOut = @import("reader/copy.zig").PgCopyOut;
 
-const QUEUE_DEPTH: u32 = 128;
+const QUEUE_DEPTH: u32 = 1024;
 
 pub const Handler = struct {
     ring: linux.IoUring,
     file_offset: u64,
     pending_writes: u32,
+    is_poll_armed: bool = false,
 
     slots: [QUEUE_DEPTH]Slot,
     free_slots_head: ?*Slot,
+    poll_slot: Slot,
 
     pub const Tag = enum(u8) {
         socket_poll,
@@ -35,6 +37,12 @@ pub const Handler = struct {
             .pending_writes = 0,
             .slots = undefined,
             .free_slots_head = null,
+            .poll_slot = .{
+                .tag = .socket_poll,
+                .index = 0xFFFF,
+                .chunk = null,
+                .next_free = null,
+            },
         };
 
         for (&self.slots, 0..) |*slot, i| {
@@ -51,6 +59,7 @@ pub const Handler = struct {
     }
 
     pub fn deinit(self: *Handler) void {
+        self.flushPendingWrites();
         assert(self.pending_writes == 0);
         self.ring.deinit();
     }
@@ -63,20 +72,14 @@ pub const Handler = struct {
         assert(file_fd >= 0);
         const pq_fd = copy_stream.getSocketFd();
 
-        var poll_slot = Slot{
-            .tag = .socket_poll,
-            .index = 0xFFFF,
-            .chunk = null,
-            .next_free = null,
-        };
-
-        try self.armPoll(pq_fd, &poll_slot);
+        try self.armPoll(pq_fd);
         var copy_completed = false;
         var cqes_buf: [QUEUE_DEPTH]linux.io_uring_cqe = undefined;
 
+        defer self.flushPendingWrites();
+
         while (!copy_completed or self.pending_writes > 0) {
-            const completions = try self.ring.submit_and_wait(1);
-            assert(completions > 0);
+            _ = try self.ring.submit_and_wait(1);
 
             const count = try self.ring.copy_cqes(
                 &cqes_buf,
@@ -84,38 +87,23 @@ pub const Handler = struct {
             );
 
             for (cqes_buf[0..count]) |cqe| {
-                assert(cqe.res > 0);
+                if (cqe.res < 0) {
+                    std.log.err("io_uring Async I/O Error: {d}", .{cqe.res});
+                    return error.IoUringOperationFailed;
+                }
+
                 const slot: *Slot = @ptrFromInt(cqe.user_data);
 
                 switch (slot.tag) {
                     .socket_poll => {
+                        self.is_poll_armed = false;
                         try copy_stream.consumeInput();
-
-                        var iteration: u32 = 0;
-                        const max_iterations_per_event: u32 = 1_000;
-
-                        while (iteration < max_iterations_per_event) : (iteration += 1) {
-                            switch (copy_stream.read()) {
-                                .chunk => |chunk| {
-                                    try self.submitWrite(
-                                        file_fd,
-                                        chunk,
-                                    );
-                                },
-                                .would_block => {
-                                    try self.armPoll(pq_fd, &poll_slot);
-                                    break;
-                                },
-                                .done => {
-                                    copy_completed = true;
-                                    break;
-                                },
-                                .err => |e| {
-                                    std.log.err("Error: {s}", .{e});
-                                    return error.PostgresCopyStreamError;
-                                },
-                            }
-                        }
+                        try self.drainCopy(
+                            copy_stream,
+                            file_fd,
+                            pq_fd,
+                            &copy_completed,
+                        );
                     },
                     .file_write => {
                         assert(self.pending_writes > 0);
@@ -127,8 +115,45 @@ pub const Handler = struct {
                         }
 
                         self.releaseSlot(slot);
+
+                        if (!copy_completed) {
+                            try self.drainCopy(
+                                copy_stream,
+                                file_fd,
+                                pq_fd,
+                                &copy_completed,
+                            );
+                        }
                     },
                 }
+            }
+        }
+    }
+
+    fn drainCopy(
+        self: *Handler,
+        copy_stream: *PgCopyOut,
+        file_fd: posix.fd_t,
+        pq_fd: posix.fd_t,
+        copy_completed: *bool,
+    ) !void {
+        while (self.free_slots_head != null) {
+            switch (copy_stream.read()) {
+                .chunk => |chunk| {
+                    try self.submitWrite(file_fd, chunk);
+                },
+                .would_block => {
+                    try self.armPoll(pq_fd);
+                    break;
+                },
+                .done => {
+                    copy_completed.* = true;
+                    break;
+                },
+                .err => |msg| {
+                    std.log.err("Postgres copy error: {s}", .{msg});
+                    return error.PostgresCopyStreamError;
+                },
             }
         }
     }
@@ -136,12 +161,12 @@ pub const Handler = struct {
     fn armPoll(
         self: *Handler,
         fd: posix.fd_t,
-        slot: *Slot,
     ) !void {
-        assert(slot.tag == .socket_poll);
+        if (self.is_poll_armed) return;
         const sqe = try self.ring.get_sqe();
         sqe.prep_poll_add(fd, linux.POLL.IN);
-        sqe.user_data = @intFromPtr(slot);
+        sqe.user_data = @intFromPtr(&self.poll_slot);
+        self.is_poll_armed = true;
     }
 
     fn submitWrite(
@@ -182,5 +207,32 @@ pub const Handler = struct {
     ) void {
         slot.next_free = self.free_slots_head;
         self.free_slots_head = slot;
+    }
+
+    fn flushPendingWrites(self: *Handler) void {
+        var cqes_buf: [QUEUE_DEPTH]linux.io_uring_cqe = undefined;
+
+        while (self.pending_writes > 0) {
+            _ = self.ring.submit_and_wait(1) catch break;
+            const count = self.ring.copy_cqes(
+                &cqes_buf,
+                0,
+            ) catch {
+                break;
+            };
+            for (cqes_buf[0..count]) |cqe| {
+                const slot: *Slot = @ptrFromInt(cqe.user_data);
+                if (slot.tag == .file_write) {
+                    if (self.pending_writes > 0) {
+                        self.pending_writes -= 1;
+                    }
+                    if (slot.chunk) |chunk| {
+                        chunk.deinit();
+                        slot.chunk = null;
+                    }
+                    self.releaseSlot(slot);
+                }
+            }
+        }
     }
 };

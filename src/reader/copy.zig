@@ -1,7 +1,7 @@
 const std = @import("std");
-const assert = std.debug.assert;
 const posix = std.posix;
-const c = @import("libpq");
+const assert = std.debug.assert;
+const c = @import("c.zig").c;
 
 pub const PgCopyOut = struct {
     conn_handle: *c.PGconn,
@@ -97,10 +97,7 @@ pub const PgCopyOut = struct {
             } else if (bytes_read == 0) {
                 return .would_block;
             } else if (bytes_read == -1) {
-                if (!self.drainResults()) {
-                    return .would_block;
-                }
-
+                self.drainResults();
                 self.state = .done;
                 return .done;
             } else {
@@ -115,11 +112,16 @@ pub const PgCopyOut = struct {
         return .done;
     }
 
-    fn drainResults(self: *PgCopyOut) bool {
-        while (c.PQisBusy(self.conn_handle) == 0) {
-            const res = c.PQgetResult(self.conn_handle) orelse return true;
+    fn drainResults(self: *PgCopyOut) void {
+        while (true) {
+            if (c.PQisBusy(self.conn_handle) != 0) {
+                if (c.PQconsumeInput(self.conn_handle) == 0) break;
+                if (c.PQisBusy(self.conn_handle) != 0) break;
+            }
+            const res = c.PQgetResult(self.conn_handle) orelse {
+                break;
+            };
             c.PQclear(res);
         }
-        return false;
     }
 };
